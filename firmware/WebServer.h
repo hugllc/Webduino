@@ -26,20 +26,14 @@
 #ifndef WEBDUINO_H_
 #define WEBDUINO_H_
 
-#define SPARK_CORE
-
 #include <string.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <stdio.h>
 
-#ifndef SPARK_CORE
-#include <Ethernet.h>
-#include <EthernetClient.h>
-#include <EthernetServer.h>
-#else
-
+#ifdef SPARK_CORE
+#include "application.h"
 #define pgm_read_byte(x) (*((uint8_t*)x))
-
 #endif
 
 // TODO - this is necessary to avoid sockets being unexpectedly closed.
@@ -142,26 +136,15 @@
 	#define SERIAL_DUMP(buf, len)
 #endif
 
-#if WEBDUINO_SERIAL_DEBUGGING && !defined(SPARK_CORE)
-#include <HardwareSerial.h>
-#endif
-
 // declared in wiring.h
 extern "C" unsigned long millis(void);
 
 // declare a static string
-#ifdef __AVR__
-#define P(name)   static const unsigned char name[] __attribute__(( section(".progmem." #name) ))
-#else
 #define P(name)   static const unsigned char name[]
-#endif
 
 // returns the number of elements in the array
 #define SIZE(array) (sizeof(array) / sizeof(*array))
 
-#ifdef _VARIANT_ARDUINO_DUE_X_
-#define pgm_read_byte(ptr) (unsigned char)(* ptr)
-#endif
 /********************************************************************
  * DECLARATIONS
  ********************************************************************/
@@ -177,7 +160,7 @@ enum URLPARAM_RESULT { URLPARAM_OK,
                        URLPARAM_EOS         // No params left
 };
 
-class WebServer: public Print
+class WebServer
 {
 public:
   // passed to a command to indicate what kind of request was received
@@ -249,6 +232,9 @@ public:
   #ifdef F
   void printf(const __FlashStringHelper *format, ... );
   #endif
+  
+  // This is for printing strings out.  With this we don't need to be a subclass of Print
+  void print(const char *str) { write((const uint8_t*)str, strlen(str)); }
 
   // output raw data stored in program memory
   void writeP(const unsigned char *data, size_t length);
@@ -288,6 +274,20 @@ public:
   // returns true if we're not at end-of-stream
   bool readPOSTparam(char *name, int nameLen, char *value, int valueLen);
 
+  // Read the next keyword parameter from the socket.  Assumes that other
+  // code has already skipped over the headers,  and the next thing to
+  // be read will be the start of a keyword.
+  //
+  // returns true if we're not at end-of-stream
+  bool readJSONparam(char *name, int nameLen, char *value, int valueLen);
+
+  // Reads the body of the message in.  Assumes that other
+  // code has already skipped over the headers,  and the next thing to
+  // be read will be the start of the body.
+  //
+  // returns true if we're not at end-of-stream
+  bool readBody(char *buffer, int bufferLen);
+  
   // Read the next keyword parameter from the buffer filled by getRequest.
   //
   // returns 0 if everything weent okay,  non-zero if not
@@ -340,13 +340,8 @@ public:
   void reset(); 
 private:
   
-#ifdef SPARK_CORE
   TCPServer m_server;
   TCPClient m_client;
-#else
-  EthernetServer m_server;
-  EthernetClient m_client;
-#endif  
   const char *m_urlPrefix;
 
   unsigned char m_pushback[32];
@@ -472,29 +467,12 @@ void WebServer::flushBuf()
 void WebServer::writeP(const unsigned char *data, size_t length)
 {
   // copy data out of program memory into local storage
-#ifdef SPARK_CORE
-    fixmedelay();    
    write(data, length);
-#else
-  while (length--)
-  {
-    write(pgm_read_byte(data++));
-  }
-#endif  
 }
 
 void WebServer::printP(const unsigned char *str)
 {
-  // copy data out of program memory into local storage
-#ifdef SPARK_CORE
-    fixmedelay();
     write((const uint8_t*)str, strlen((const char*)str));
-#else
-  while (uint8_t value = pgm_read_byte(str++))
-  {
-    write(value);
-  }
-#endif  
 }
 
 void WebServer::printCRLF()
@@ -518,11 +496,7 @@ void WebServer::printf(const __FlashStringHelper *format, ... )
   char buf[128]; // resulting string limited to 128 chars
   va_list ap;
   va_start(ap, format);
-#ifdef __AVR__
-  vsnprintf_P(buf, sizeof(buf), (const char *)format, ap); // progmem for AVR
-#else
   vsnprintf(buf, sizeof(buf), (const char *)format, ap); // for the rest of the world
-#endif  
   va_end(ap);
   print(buf);
 }
@@ -1041,7 +1015,7 @@ bool WebServer::readPOSTparam(char *name, int nameLen,
       int ch2 = read();
       if (ch1 == -1 || ch2 == -1)
         return false;
-      char hex[3] = { ch1, ch2, '\x0' };
+      char hex[3] = { (char)ch1, (char)ch2, '\x0' };
       ch = strtoul(hex, NULL, 16);
     }
 
@@ -1059,6 +1033,152 @@ bool WebServer::readPOSTparam(char *name, int nameLen,
     {
       *value++ = ch;
       --valueLen;
+    }
+  }
+
+  if (foundSomething)
+  {
+    // if we get here, we have one last parameter to serve
+    return true;
+  }
+  else
+  {
+    // if we get here, we hit the end-of-file, so POST is over and there
+    // are no more parameters
+    return false;
+  }
+}
+bool WebServer::readJSONparam(char *name, int nameLen,
+                              char *value, int valueLen)
+{
+  // assume name is at current place in stream
+  int ch;
+  // to not to miss the last parameter
+  bool foundSomething = false;
+  
+  int q1 = 0, q2 = 0;
+  
+  // clear out name and value so they'll be NUL terminated
+  memset(name, 0, nameLen);
+  memset(value, 0, valueLen);
+
+  // decrement length so we don't write into NUL terminator
+  --nameLen;
+  --valueLen;
+
+  while ((ch = read()) != -1)
+  {
+    foundSomething = true;
+    if ((ch == '}') && (nameLen > 0))
+    {
+        // Reached the end of the output
+        foundSomething = false;
+        // Exit.
+        break;
+    }
+    else if ((ch == '{') && (nameLen > 0))
+    {
+        // Ignore this  opening bracket
+        continue;
+    }
+    else if (ch == ':')
+    {
+      /* that's end of name, so switch to storing in value */
+      nameLen = 0;
+      q1 = 0;
+      q2 = 0;
+      continue;
+    }
+    else if (ch == ',')
+    {
+        if (((q1 == 0) || (q1 == 2)) && ((q2 == 0) || (q2 == 2))) {
+            /* that's end of pair, go away */
+            break;
+        }
+    }
+    else if ((q1 == 2) || (q2 == 2))
+    {
+        // The quote is closed, so we are at an end
+        continue;
+    }
+    else if ((q1 == 0) && (q1 == 0) && ((ch == ' ') || (ch == '\r') || (ch == '\n') || (ch == '\t')))
+    {
+        // The quote is closed, so we are at an end
+        continue;
+    }
+    else if (ch == '\'')
+    {
+        if (q2 == 0) {
+            q1++;
+            // Ignore quote marks, and while space
+            continue;
+        }
+    }
+    else if (ch == '"')
+    {
+        if (q1 == 0) {
+            q2++;
+            // Ignore quote marks, and while space
+            continue;
+        }
+    }
+
+    // output the new character into the appropriate buffer or drop it if
+    // there's no room in either one.  This code will malfunction in the
+    // case where the parameter name is too long to fit into the name buffer,
+    // but in that case, it will just overflow into the value buffer so
+    // there's no harm.
+    if (nameLen > 0)
+    {
+      *name++ = ch;
+      --nameLen;
+    }
+    else if (valueLen > 0)
+    {
+      *value++ = ch;
+      --valueLen;
+    }
+  }
+
+  if (foundSomething)
+  {
+    // if we get here, we have one last parameter to serve
+    return true;
+  }
+  else
+  {
+    // if we get here, we hit the end-of-file, so POST is over and there
+    // are no more parameters
+    return false;
+  }
+}
+
+bool WebServer::readBody(char *buffer, int bufferLen)
+{
+  // assume name is at current place in stream
+  int ch;
+  // to not to miss the last parameter
+  bool foundSomething = false;
+
+  // clear out name and value so they'll be NUL terminated
+  memset(buffer, 0, bufferLen);
+
+  // decrement length so we don't write into NUL terminator
+  --bufferLen;
+
+  while ((ch = read()) != -1)
+  {
+    foundSomething = true;
+
+    // output the new character into the appropriate buffer or drop it if
+    // there's no room in either one.  This code will malfunction in the
+    // case where the parameter name is too long to fit into the name buffer,
+    // but in that case, it will just overflow into the value buffer so
+    // there's no harm.
+    if (bufferLen > 0)
+    {
+      *buffer++ = ch;
+      --bufferLen;
     }
   }
 
